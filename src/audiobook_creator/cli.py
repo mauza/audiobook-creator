@@ -47,14 +47,43 @@ def cli():
 @click.option(
     "--device",
     "-d",
-    default="cuda:0",
-    help="Device to run the model on (e.g. cuda:0, cpu)",
+    default="auto",
+    help="Device(s): auto (all GPUs), cuda:0, cuda:0,cuda:1, or cpu",
 )
 @click.option(
     "--encoding",
     "-e",
     default="utf-8",
     help="Input file encoding",
+)
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["wav", "mp3"]),
+    default="wav",
+    help="Output audio format",
+)
+@click.option(
+    "--chapters/--no-chapters",
+    default=False,
+    help="Split output by chapters",
+)
+@click.option(
+    "--skip-front-matter/--include-front-matter",
+    default=True,
+    help="Skip front matter in EPUB files (cover, TOC, copyright, etc.)",
+)
+@click.option(
+    "--voice-sample",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to a reference audio file for voice cloning (10-30s, clean audio)",
+)
+@click.option(
+    "--voice-text",
+    default=None,
+    help="Transcript of the voice sample (recommended for better quality)",
 )
 def convert_file(
     input_file: str,
@@ -64,6 +93,11 @@ def convert_file(
     model: str,
     device: str,
     encoding: str,
+    output_format: str,
+    chapters: bool,
+    skip_front_matter: bool,
+    voice_sample: str,
+    voice_text: str,
 ):
     """Convert a text file to an audiobook."""
     try:
@@ -73,11 +107,16 @@ def convert_file(
             language=language,
             model_name=model,
             device=device,
+            output_format=output_format,
+            voice_sample=voice_sample,
+            voice_text=voice_text,
         )
 
         output_path = converter.convert_file(
             input_file=input_file,
             encoding=encoding,
+            chapter_aware=chapters,
+            skip_front_matter=skip_front_matter,
         )
 
         console.print(f"[green]Successfully created audiobook:[/green] {output_path}")
@@ -118,8 +157,27 @@ def convert_file(
 @click.option(
     "--device",
     "-d",
-    default="cuda:0",
-    help="Device to run the model on (e.g. cuda:0, cpu)",
+    default="auto",
+    help="Device(s): auto (all GPUs), cuda:0, cuda:0,cuda:1, or cpu",
+)
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["wav", "mp3"]),
+    default="wav",
+    help="Output audio format",
+)
+@click.option(
+    "--voice-sample",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to a reference audio file for voice cloning (10-30s, clean audio)",
+)
+@click.option(
+    "--voice-text",
+    default=None,
+    help="Transcript of the voice sample (recommended for better quality)",
 )
 def convert_text(
     text: str,
@@ -129,6 +187,9 @@ def convert_text(
     language: str,
     model: str,
     device: str,
+    output_format: str,
+    voice_sample: str,
+    voice_text: str,
 ):
     """Convert text to an audiobook."""
     try:
@@ -138,6 +199,9 @@ def convert_text(
             language=language,
             model_name=model,
             device=device,
+            output_format=output_format,
+            voice_sample=voice_sample,
+            voice_text=voice_text,
         )
 
         output_path = converter.convert_text(

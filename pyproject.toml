@@ -15,8 +15,16 @@ dependencies = [
     "ebooklib>=0.18",
     "lxml>=4.9.0",
     "beautifulsoup4>=4.12.0",
+    "num2words>=0.5.13",
+    "pydub>=0.25.1",
 ]
 requires-python = ">=3.11,<3.13"
+
+[project.scripts]
+audiobook-creator = "audiobook_creator.cli:cli"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [build-system]
 requires = ["hatchling"]

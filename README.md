@@ -1,12 +1,11 @@
 # Audiobook Creator
 
-A Python tool that converts text to audiobooks using the Kokoro TTS model. This tool is designed to help create audiobooks from text files, with configurable voice and language options.
+A Python tool that converts text to audiobooks using the Qwen3-TTS model. This tool is designed to help create audiobooks from text files, with configurable voice and language options.
 
 ## Features
 
 - Convert text files to audiobooks
 - Support for multiple languages and voices
-- Configurable speech speed
 - Progress tracking during conversion
 - Docker support for easy deployment
 
@@ -32,33 +31,30 @@ The tool provides two main commands:
 
 1. Convert a text file to an audiobook:
 ```bash
-audiobook-creator convert-file input.txt --output-dir output --voice af_heart --language a --speed 1.0
+audiobook-creator convert-file input.txt --output-dir output --voice Ryan --language English
 ```
 
 2. Convert text directly to an audiobook:
 ```bash
-audiobook-creator convert-text "Your text here" output_filename --output-dir output --voice af_heart --language a --speed 1.0
+audiobook-creator convert-text "Your text here" output_filename --output-dir output --voice Ryan --language English
 ```
 
 ### Options
 
 - `--output-dir`, `-o`: Directory to save the audio file (default: "output")
-- `--voice`, `-v`: Voice to use for synthesis (default: "af_heart")
-- `--language`, `-l`: Language code (default: "a" for American English)
-- `--speed`, `-s`: Speech speed multiplier (default: 1.0)
-- `--encoding`, `-e`: Input file encoding (default: "utf-8")
+- `--voice`, `-v`: Speaker voice (default: "Ryan")
+- `--language`, `-l`: Language (default: "English")
+- `--model`, `-m`: Qwen3-TTS model name or path (default: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+- `--device`, `-d`: Device to run the model on (default: "cuda:0")
+- `--encoding`, `-e`: Input file encoding (default: "utf-8", convert-file only)
 
-### Language Codes
+### Available Speakers
 
-- `a`: American English
-- `b`: British English
-- `e`: Spanish
-- `f`: French
-- `h`: Hindi
-- `i`: Italian
-- `j`: Japanese
-- `p`: Brazilian Portuguese
-- `z`: Mandarin Chinese
+Vivian, Serena, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee, Uncle_Fu
+
+### Available Languages
+
+Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
 ### Using Docker
 
@@ -94,6 +90,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgments
 
-- [Kokoro TTS](https://github.com/hexgrad/kokoro) for the text-to-speech model
+- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) for the text-to-speech model
 - [Click](https://click.palletsprojects.com/) for the CLI framework
-- [Rich](https://github.com/Textualize/rich) for the terminal formatting 
+- [Rich](https://github.com/Textualize/rich) for the terminal formatting
