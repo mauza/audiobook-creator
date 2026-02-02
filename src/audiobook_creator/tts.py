@@ -2,10 +2,9 @@
 
 import re
 import tempfile
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Generator, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -27,8 +26,8 @@ from audiobook_creator.file_handlers import (
 )
 
 
-class _TTSWorker:
-    """A single TTS model instance bound to one device with its own CUDA stream."""
+class _GPUWorker:
+    """A single TTS model instance bound to one GPU."""
 
     def __init__(
         self,
@@ -49,40 +48,22 @@ class _TTSWorker:
         self.voice = voice
         self.language = language
         self.voice_clone_prompt = voice_clone_prompt
-        self.lock = threading.Lock()
 
-        # Each worker gets its own CUDA stream for true parallel execution on the same GPU
-        if device.startswith("cuda"):
-            dev_idx = int(device.split(":")[1]) if ":" in device else 0
-            self.stream = torch.cuda.Stream(device=dev_idx)
-        else:
-            self.stream = None
-
-    def generate(self, text: str) -> Tuple[np.ndarray, int]:
-        """Generate audio for a text chunk. Uses a dedicated CUDA stream."""
-        with self.lock:
-            if self.stream is not None:
-                with torch.cuda.stream(self.stream):
-                    result = self._run_inference(text)
-                self.stream.synchronize()
-                return result
-            else:
-                return self._run_inference(text)
-
-    def _run_inference(self, text: str) -> Tuple[np.ndarray, int]:
+    def generate_batch(self, texts: List[str]) -> Tuple[List[np.ndarray], int]:
+        """Generate audio for a batch of text chunks in a single forward pass."""
         if self.voice_clone_prompt:
             wavs, sr = self.model.generate_voice_clone(
-                text=text,
+                text=texts,
                 language=self.language,
                 voice_clone_prompt=self.voice_clone_prompt,
             )
         else:
             wavs, sr = self.model.generate_custom_voice(
-                text=text,
+                text=texts,
                 language=self.language,
                 speaker=self.voice,
             )
-        return wavs[0], sr
+        return wavs, sr
 
 
 class TTSConverter:
@@ -103,7 +84,7 @@ class TTSConverter:
         output_format: str = "wav",
         voice_sample: Optional[str] = None,
         voice_text: Optional[str] = None,
-        workers_per_device: int = 2,
+        batch_size: int = 4,
     ):
         """Initialize the TTS converter.
 
@@ -117,7 +98,7 @@ class TTSConverter:
             output_format: Output audio format ("wav" or "mp3")
             voice_sample: Path to a reference audio file for voice cloning
             voice_text: Transcript of the voice sample (recommended for quality)
-            workers_per_device: Number of model instances per device (default 2)
+            batch_size: Number of chunks to process per inference call (default 4)
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +107,7 @@ class TTSConverter:
         self.chunk_size = chunk_size
         self.sample_rate = None
         self.output_format = output_format
+        self.batch_size = batch_size
 
         # Resolve device list
         devices = self._resolve_devices(device)
@@ -149,37 +131,29 @@ class TTSConverter:
                 x_vector_only_mode=voice_text is None,
             )
             # Reuse this as the first worker instead of reloading
-            first_worker = _TTSWorker.__new__(_TTSWorker)
+            first_worker = _GPUWorker.__new__(_GPUWorker)
             first_worker.device = devices[0]
             first_worker.model = tmp_model
             first_worker.voice = voice
             first_worker.language = language
             first_worker.voice_clone_prompt = voice_clone_prompt
-            first_worker.lock = threading.Lock()
-            if devices[0].startswith("cuda"):
-                dev_idx = int(devices[0].split(":")[1]) if ":" in devices[0] else 0
-                first_worker.stream = torch.cuda.Stream(device=dev_idx)
-            else:
-                first_worker.stream = None
         else:
             first_worker = None
 
-        # Create workers: workers_per_device instances on each device
-        self.workers: List[_TTSWorker] = []
-        for dev in devices:
-            for w_idx in range(workers_per_device):
-                # Reuse the first_worker we already loaded (if applicable)
-                if first_worker is not None and dev == devices[0] and w_idx == 0:
-                    self.workers.append(first_worker)
-                    continue
-                worker = _TTSWorker(
-                    model_name=model_name,
-                    device=dev,
-                    voice=voice,
-                    language=language,
-                    voice_clone_prompt=voice_clone_prompt,
-                )
-                self.workers.append(worker)
+        # Create one worker per GPU
+        self.workers: List[_GPUWorker] = []
+        for i, dev in enumerate(devices):
+            if first_worker is not None and i == 0:
+                self.workers.append(first_worker)
+                continue
+            worker = _GPUWorker(
+                model_name=model_name,
+                device=dev,
+                voice=voice,
+                language=language,
+                voice_clone_prompt=voice_clone_prompt,
+            )
+            self.workers.append(worker)
 
     @staticmethod
     def _resolve_devices(device: str) -> List[str]:
@@ -193,7 +167,6 @@ class TTSConverter:
 
         if "," in device:
             devices = [d.strip() for d in device.split(",")]
-            # Validate CUDA devices exist
             if torch.cuda.is_available():
                 return devices
             return ["cpu"]
@@ -239,30 +212,33 @@ class TTSConverter:
 
         return chunks
 
-    def _process_chunk_on_worker(
+    def _process_batch_on_worker(
         self,
-        worker: _TTSWorker,
-        text_chunk: str,
+        worker: _GPUWorker,
+        text_chunks: List[str],
         temp_dir: Path,
-        chunk_index: int,
-    ) -> Tuple[int, Path, float]:
-        """Process a single chunk using a specific worker.
+        chunk_indices: List[int],
+    ) -> List[Tuple[int, Path, float]]:
+        """Process a batch of chunks using a specific worker.
 
         Returns:
-            Tuple of (chunk_index, path to temp file, duration)
+            List of (chunk_index, path to temp file, duration) tuples
         """
-        temp_file = temp_dir / f"chunk_{chunk_index:04d}.wav"
-        audio, sr = worker.generate(text_chunk)
+        wavs, sr = worker.generate_batch(text_chunks)
 
         if self.sample_rate is None:
             self.sample_rate = sr
 
-        if len(audio) == 0:
-            raise ValueError(f"No audio was generated for chunk {chunk_index}")
+        results = []
+        for i, (idx, audio) in enumerate(zip(chunk_indices, wavs)):
+            if len(audio) == 0:
+                raise ValueError(f"No audio was generated for chunk {idx}")
+            temp_file = temp_dir / f"chunk_{idx:04d}.wav"
+            sf.write(temp_file, audio, sr)
+            duration = len(audio) / sr
+            results.append((idx, temp_file, duration))
 
-        sf.write(temp_file, audio, sr)
-        duration = len(audio) / sr
-        return chunk_index, temp_file, duration
+        return results
 
     def _process_chunks_parallel(
         self,
@@ -272,7 +248,7 @@ class TTSConverter:
         task_id,
         completed_offset: int = 0,
     ) -> List[Path]:
-        """Process text chunks in parallel across all workers.
+        """Process text chunks in parallel across all workers using batched inference.
 
         Args:
             completed_offset: Number of already-completed chunks (for progress tracking
@@ -280,33 +256,63 @@ class TTSConverter:
 
         Returns chunk files in original order.
         """
-        num_workers = len(self.workers)
+        num_gpus = len(self.workers)
         results: dict[int, Path] = {}
         completed = 0
 
-        if num_workers == 1:
-            for i, chunk in enumerate(text_chunks):
-                _, chunk_file, _ = self._process_chunk_on_worker(
-                    self.workers[0], chunk, temp_dir, i
-                )
-                results[i] = chunk_file
-                completed += 1
-                progress.update(task_id, completed=completed_offset + completed)
-        else:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {}
-                for i, chunk in enumerate(text_chunks):
-                    worker = self.workers[i % num_workers]
-                    future = executor.submit(
-                        self._process_chunk_on_worker,
-                        worker, chunk, temp_dir, i,
-                    )
-                    futures[future] = i
+        if num_gpus == 1:
+            # Single GPU: process in batches sequentially
+            worker = self.workers[0]
+            for batch_start in range(0, len(text_chunks), self.batch_size):
+                batch_end = min(batch_start + self.batch_size, len(text_chunks))
+                batch_texts = text_chunks[batch_start:batch_end]
+                batch_indices = list(range(batch_start, batch_end))
 
-                for future in as_completed(futures):
-                    idx, chunk_file, duration = future.result()
+                batch_results = self._process_batch_on_worker(
+                    worker, batch_texts, temp_dir, batch_indices,
+                )
+                for idx, chunk_file, _ in batch_results:
                     results[idx] = chunk_file
                     completed += 1
+                    progress.update(task_id, completed=completed_offset + completed)
+        else:
+            # Multi-GPU: split chunks into contiguous blocks per GPU
+            # Each GPU processes its block in batches via a thread
+            chunks_per_gpu = len(text_chunks) // num_gpus
+            remainder = len(text_chunks) % num_gpus
+
+            gpu_assignments = []  # (worker, start_idx, end_idx)
+            offset = 0
+            for gpu_idx in range(num_gpus):
+                count = chunks_per_gpu + (1 if gpu_idx < remainder else 0)
+                gpu_assignments.append((self.workers[gpu_idx], offset, offset + count))
+                offset += count
+
+            def process_gpu_block(worker, start, end):
+                block_results = []
+                for batch_start in range(start, end, self.batch_size):
+                    batch_end = min(batch_start + self.batch_size, end)
+                    batch_texts = text_chunks[batch_start:batch_end]
+                    batch_indices = list(range(batch_start, batch_end))
+                    batch_results = self._process_batch_on_worker(
+                        worker, batch_texts, temp_dir, batch_indices,
+                    )
+                    block_results.extend(batch_results)
+                return block_results
+
+            with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                futures = {}
+                for worker, start, end in gpu_assignments:
+                    if start == end:
+                        continue
+                    future = executor.submit(process_gpu_block, worker, start, end)
+                    futures[future] = (start, end)
+
+                for future in as_completed(futures):
+                    batch_results = future.result()
+                    for idx, chunk_file, _ in batch_results:
+                        results[idx] = chunk_file
+                        completed += 1
                     progress.update(task_id, completed=completed_offset + completed)
 
         return [results[i] for i in range(len(text_chunks))]
@@ -403,7 +409,7 @@ class TTSConverter:
         book_dir.mkdir(parents=True, exist_ok=True)
 
         text_chunks = self._split_text_into_chunks(text)
-        num_workers = len(self.workers)
+        num_gpus = len(self.workers)
 
         max_samples = None
         silence = None
@@ -423,48 +429,77 @@ class TTSConverter:
                 TimeRemainingColumn(),
             ) as progress:
                 task = progress.add_task(
-                    f"Converting text to speech ({num_workers} worker{'s' if num_workers > 1 else ''})...",
+                    f"Converting text to speech ({num_gpus} GPU{'s' if num_gpus > 1 else ''}, batch size {self.batch_size})...",
                     total=len(text_chunks),
                 )
 
-                if num_workers == 1:
-                    for i, chunk in enumerate(text_chunks):
-                        _, chunk_file, _ = self._process_chunk_on_worker(
-                            self.workers[0], chunk, temp_dir, i
+                if num_gpus == 1:
+                    # Single GPU: process batches sequentially, flush incrementally
+                    worker = self.workers[0]
+                    completed_count = 0
+                    for batch_start in range(0, len(text_chunks), self.batch_size):
+                        batch_end = min(batch_start + self.batch_size, len(text_chunks))
+                        batch_texts = text_chunks[batch_start:batch_end]
+                        batch_indices = list(range(batch_start, batch_end))
+
+                        batch_results = self._process_batch_on_worker(
+                            worker, batch_texts, temp_dir, batch_indices,
                         )
 
-                        # Initialize audio params on first chunk
-                        if max_samples is None:
-                            max_samples = self._calculate_max_samples_per_file()
-                            silence_samples = int(self.sample_rate * 0.5)
-                            silence = np.zeros(silence_samples)
+                        for idx, chunk_file, _ in batch_results:
+                            if max_samples is None:
+                                max_samples = self._calculate_max_samples_per_file()
+                                silence_samples = int(self.sample_rate * 0.5)
+                                silence = np.zeros(silence_samples)
 
-                        audio, _ = sf.read(chunk_file)
-                        current_audio, current_samples, file_index = self._accumulate_and_flush(
-                            audio, current_audio, current_samples, silence,
-                            max_samples, book_dir, output_filename, "", file_index, output_files,
-                        )
-                        progress.update(task, completed=i + 1)
+                            audio, _ = sf.read(chunk_file)
+                            current_audio, current_samples, file_index = self._accumulate_and_flush(
+                                audio, current_audio, current_samples, silence,
+                                max_samples, book_dir, output_filename, "", file_index, output_files,
+                            )
+                            completed_count += 1
+                            progress.update(task, completed=completed_count)
                 else:
-                    # Process in parallel but flush as chunks complete in order
+                    # Multi-GPU: each GPU gets contiguous block, flush in-order
+                    chunks_per_gpu = len(text_chunks) // num_gpus
+                    remainder = len(text_chunks) % num_gpus
+
+                    gpu_assignments = []
+                    offset = 0
+                    for gpu_idx in range(num_gpus):
+                        count = chunks_per_gpu + (1 if gpu_idx < remainder else 0)
+                        gpu_assignments.append((self.workers[gpu_idx], offset, offset + count))
+                        offset += count
+
+                    def process_gpu_block(worker, start, end):
+                        block_results = []
+                        for batch_start in range(start, end, self.batch_size):
+                            batch_end = min(batch_start + self.batch_size, end)
+                            batch_texts = text_chunks[batch_start:batch_end]
+                            batch_indices = list(range(batch_start, batch_end))
+                            batch_results = self._process_batch_on_worker(
+                                worker, batch_texts, temp_dir, batch_indices,
+                            )
+                            block_results.extend(batch_results)
+                        return block_results
+
                     next_to_flush = 0
                     ready: dict[int, Path] = {}
+                    completed_count = 0
 
-                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    with ThreadPoolExecutor(max_workers=num_gpus) as executor:
                         futures = {}
-                        for i, chunk in enumerate(text_chunks):
-                            worker = self.workers[i % num_workers]
-                            future = executor.submit(
-                                self._process_chunk_on_worker,
-                                worker, chunk, temp_dir, i,
-                            )
-                            futures[future] = i
+                        for worker, start, end in gpu_assignments:
+                            if start == end:
+                                continue
+                            future = executor.submit(process_gpu_block, worker, start, end)
+                            futures[future] = (start, end)
 
-                        completed_count = 0
                         for future in as_completed(futures):
-                            idx, chunk_file, _ = future.result()
-                            ready[idx] = chunk_file
-                            completed_count += 1
+                            batch_results = future.result()
+                            for idx, chunk_file, _ in batch_results:
+                                ready[idx] = chunk_file
+                                completed_count += 1
                             progress.update(task, completed=completed_count)
 
                             # Flush all consecutive chunks that are ready
@@ -555,7 +590,7 @@ class TTSConverter:
             TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task(
-                f"Converting chapters ({len(self.workers)} worker{'s' if len(self.workers) > 1 else ''})...",
+                f"Converting chapters ({len(self.workers)} GPU{'s' if len(self.workers) > 1 else ''}, batch size {self.batch_size})...",
                 total=total_chunks,
             )
             global_completed = 0

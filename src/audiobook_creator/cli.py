@@ -86,11 +86,11 @@ def cli():
     help="Transcript of the voice sample (recommended for better quality)",
 )
 @click.option(
-    "--workers-per-device",
-    "-w",
-    default=2,
+    "--batch-size",
+    "-b",
+    default=4,
     type=int,
-    help="Number of model instances per GPU (default 2, increase if VRAM allows)",
+    help="Number of text chunks per batched inference call (default 4)",
 )
 def convert_file(
     input_file: str,
@@ -105,7 +105,7 @@ def convert_file(
     skip_front_matter: bool,
     voice_sample: str,
     voice_text: str,
-    workers_per_device: int,
+    batch_size: int,
 ):
     """Convert a text file to an audiobook."""
     try:
@@ -118,7 +118,7 @@ def convert_file(
             output_format=output_format,
             voice_sample=voice_sample,
             voice_text=voice_text,
-            workers_per_device=workers_per_device,
+            batch_size=batch_size,
         )
 
         output_path = converter.convert_file(
@@ -189,11 +189,11 @@ def convert_file(
     help="Transcript of the voice sample (recommended for better quality)",
 )
 @click.option(
-    "--workers-per-device",
-    "-w",
-    default=2,
+    "--batch-size",
+    "-b",
+    default=4,
     type=int,
-    help="Number of model instances per GPU (default 2, increase if VRAM allows)",
+    help="Number of text chunks per batched inference call (default 4)",
 )
 def convert_text(
     text: str,
@@ -206,7 +206,7 @@ def convert_text(
     output_format: str,
     voice_sample: str,
     voice_text: str,
-    workers_per_device: int,
+    batch_size: int,
 ):
     """Convert text to an audiobook."""
     try:
@@ -219,7 +219,7 @@ def convert_text(
             output_format=output_format,
             voice_sample=voice_sample,
             voice_text=voice_text,
-            workers_per_device=workers_per_device,
+            batch_size=batch_size,
         )
 
         output_path = converter.convert_text(
