@@ -28,7 +28,7 @@ from audiobook_creator.file_handlers import (
 
 
 class _TTSWorker:
-    """A single TTS model instance bound to one device."""
+    """A single TTS model instance bound to one device with its own CUDA stream."""
 
     def __init__(
         self,
@@ -38,6 +38,7 @@ class _TTSWorker:
         language: str,
         voice_clone_prompt=None,
     ):
+        self.device = device
         dtype = torch.float16 if device.startswith("cuda") else torch.float32
         self.model = Qwen3TTSModel.from_pretrained(
             model_name,
@@ -50,22 +51,38 @@ class _TTSWorker:
         self.voice_clone_prompt = voice_clone_prompt
         self.lock = threading.Lock()
 
+        # Each worker gets its own CUDA stream for true parallel execution on the same GPU
+        if device.startswith("cuda"):
+            dev_idx = int(device.split(":")[1]) if ":" in device else 0
+            self.stream = torch.cuda.Stream(device=dev_idx)
+        else:
+            self.stream = None
+
     def generate(self, text: str) -> Tuple[np.ndarray, int]:
-        """Generate audio for a text chunk. Thread-safe via lock."""
+        """Generate audio for a text chunk. Uses a dedicated CUDA stream."""
         with self.lock:
-            if self.voice_clone_prompt:
-                wavs, sr = self.model.generate_voice_clone(
-                    text=text,
-                    language=self.language,
-                    voice_clone_prompt=self.voice_clone_prompt,
-                )
+            if self.stream is not None:
+                with torch.cuda.stream(self.stream):
+                    result = self._run_inference(text)
+                self.stream.synchronize()
+                return result
             else:
-                wavs, sr = self.model.generate_custom_voice(
-                    text=text,
-                    language=self.language,
-                    speaker=self.voice,
-                )
-            return wavs[0], sr
+                return self._run_inference(text)
+
+    def _run_inference(self, text: str) -> Tuple[np.ndarray, int]:
+        if self.voice_clone_prompt:
+            wavs, sr = self.model.generate_voice_clone(
+                text=text,
+                language=self.language,
+                voice_clone_prompt=self.voice_clone_prompt,
+            )
+        else:
+            wavs, sr = self.model.generate_custom_voice(
+                text=text,
+                language=self.language,
+                speaker=self.voice,
+            )
+        return wavs[0], sr
 
 
 class TTSConverter:
@@ -86,6 +103,7 @@ class TTSConverter:
         output_format: str = "wav",
         voice_sample: Optional[str] = None,
         voice_text: Optional[str] = None,
+        workers_per_device: int = 2,
     ):
         """Initialize the TTS converter.
 
@@ -99,6 +117,7 @@ class TTSConverter:
             output_format: Output audio format ("wav" or "mp3")
             voice_sample: Path to a reference audio file for voice cloning
             voice_text: Transcript of the voice sample (recommended for quality)
+            workers_per_device: Number of model instances per device (default 2)
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -117,8 +136,6 @@ class TTSConverter:
             sample_path = Path(voice_sample)
             if not sample_path.exists():
                 raise FileNotFoundError(f"Voice sample not found: {voice_sample}")
-            # Load a temporary model to create the prompt, then discard
-            # (the prompt is just tensor data, portable across devices)
             dtype = torch.float16 if devices[0].startswith("cuda") else torch.float32
             tmp_model = Qwen3TTSModel.from_pretrained(
                 model_name,
@@ -131,31 +148,38 @@ class TTSConverter:
                 ref_text=voice_text,
                 x_vector_only_mode=voice_text is None,
             )
-            # If only one device, reuse this model instead of loading again
-            if len(devices) == 1:
-                self.workers = [_TTSWorker.__new__(_TTSWorker)]
-                w = self.workers[0]
-                w.model = tmp_model
-                w.voice = voice
-                w.language = language
-                w.voice_clone_prompt = voice_clone_prompt
-                w.lock = threading.Lock()
-                return
-            del tmp_model
+            # Reuse this as the first worker instead of reloading
+            first_worker = _TTSWorker.__new__(_TTSWorker)
+            first_worker.device = devices[0]
+            first_worker.model = tmp_model
+            first_worker.voice = voice
+            first_worker.language = language
+            first_worker.voice_clone_prompt = voice_clone_prompt
+            first_worker.lock = threading.Lock()
             if devices[0].startswith("cuda"):
-                torch.cuda.empty_cache()
+                dev_idx = int(devices[0].split(":")[1]) if ":" in devices[0] else 0
+                first_worker.stream = torch.cuda.Stream(device=dev_idx)
+            else:
+                first_worker.stream = None
+        else:
+            first_worker = None
 
-        # Create one worker per device
+        # Create workers: workers_per_device instances on each device
         self.workers: List[_TTSWorker] = []
         for dev in devices:
-            worker = _TTSWorker(
-                model_name=model_name,
-                device=dev,
-                voice=voice,
-                language=language,
-                voice_clone_prompt=voice_clone_prompt,
-            )
-            self.workers.append(worker)
+            for w_idx in range(workers_per_device):
+                # Reuse the first_worker we already loaded (if applicable)
+                if first_worker is not None and dev == devices[0] and w_idx == 0:
+                    self.workers.append(first_worker)
+                    continue
+                worker = _TTSWorker(
+                    model_name=model_name,
+                    device=dev,
+                    voice=voice,
+                    language=language,
+                    voice_clone_prompt=voice_clone_prompt,
+                )
+                self.workers.append(worker)
 
     @staticmethod
     def _resolve_devices(device: str) -> List[str]:
@@ -385,7 +409,7 @@ class TTSConverter:
                 TimeRemainingColumn(),
             ) as progress:
                 task = progress.add_task(
-                    f"Converting text to speech ({len(self.workers)} GPU{'s' if len(self.workers) > 1 else ''})...",
+                    f"Converting text to speech ({len(self.workers)} worker{'s' if len(self.workers) > 1 else ''})...",
                     total=len(text_chunks),
                 )
 
