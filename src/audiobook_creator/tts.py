@@ -270,8 +270,13 @@ class TTSConverter:
         temp_dir: Path,
         progress: Progress,
         task_id,
+        completed_offset: int = 0,
     ) -> List[Path]:
         """Process text chunks in parallel across all workers.
+
+        Args:
+            completed_offset: Number of already-completed chunks (for progress tracking
+                across multiple calls sharing the same progress bar)
 
         Returns chunk files in original order.
         """
@@ -280,16 +285,14 @@ class TTSConverter:
         completed = 0
 
         if num_workers == 1:
-            # Single device: process sequentially (no thread overhead)
             for i, chunk in enumerate(text_chunks):
                 _, chunk_file, _ = self._process_chunk_on_worker(
                     self.workers[0], chunk, temp_dir, i
                 )
                 results[i] = chunk_file
                 completed += 1
-                progress.update(task_id, completed=completed)
+                progress.update(task_id, completed=completed_offset + completed)
         else:
-            # Multi-device: submit chunks round-robin to workers
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 futures = {}
                 for i, chunk in enumerate(text_chunks):
@@ -304,9 +307,8 @@ class TTSConverter:
                     idx, chunk_file, duration = future.result()
                     results[idx] = chunk_file
                     completed += 1
-                    progress.update(task_id, completed=completed)
+                    progress.update(task_id, completed=completed_offset + completed)
 
-        # Return files in original chunk order
         return [results[i] for i in range(len(text_chunks))]
 
     def _write_audio_file(
@@ -390,13 +392,25 @@ class TTSConverter:
         output_filename: str,
         split_pattern: str = r"\n+",
     ) -> List[Path]:
-        """Convert text to speech and save as audio files."""
+        """Convert text to speech and save as audio files.
+
+        Writes output files incrementally as chunks are combined,
+        so partial results are available on disk during processing.
+        """
         text = _normalize_for_tts(text)
 
         book_dir = self.output_dir / output_filename
         book_dir.mkdir(parents=True, exist_ok=True)
 
         text_chunks = self._split_text_into_chunks(text)
+        num_workers = len(self.workers)
+
+        max_samples = None
+        silence = None
+        current_audio = None
+        current_samples = 0
+        file_index = 1
+        output_files = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir = Path(temp_dir)
@@ -409,78 +423,157 @@ class TTSConverter:
                 TimeRemainingColumn(),
             ) as progress:
                 task = progress.add_task(
-                    f"Converting text to speech ({len(self.workers)} worker{'s' if len(self.workers) > 1 else ''})...",
+                    f"Converting text to speech ({num_workers} worker{'s' if num_workers > 1 else ''})...",
                     total=len(text_chunks),
                 )
 
-                chunk_files = self._process_chunks_parallel(
-                    text_chunks, temp_dir, progress, task
-                )
+                if num_workers == 1:
+                    for i, chunk in enumerate(text_chunks):
+                        _, chunk_file, _ = self._process_chunk_on_worker(
+                            self.workers[0], chunk, temp_dir, i
+                        )
 
-            output_files = self._combine_chunks_to_files(
-                chunk_files, book_dir, output_filename
-            )
+                        # Initialize audio params on first chunk
+                        if max_samples is None:
+                            max_samples = self._calculate_max_samples_per_file()
+                            silence_samples = int(self.sample_rate * 0.5)
+                            silence = np.zeros(silence_samples)
+
+                        audio, _ = sf.read(chunk_file)
+                        current_audio, current_samples, file_index = self._accumulate_and_flush(
+                            audio, current_audio, current_samples, silence,
+                            max_samples, book_dir, output_filename, "", file_index, output_files,
+                        )
+                        progress.update(task, completed=i + 1)
+                else:
+                    # Process in parallel but flush as chunks complete in order
+                    next_to_flush = 0
+                    ready: dict[int, Path] = {}
+
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                        futures = {}
+                        for i, chunk in enumerate(text_chunks):
+                            worker = self.workers[i % num_workers]
+                            future = executor.submit(
+                                self._process_chunk_on_worker,
+                                worker, chunk, temp_dir, i,
+                            )
+                            futures[future] = i
+
+                        completed_count = 0
+                        for future in as_completed(futures):
+                            idx, chunk_file, _ = future.result()
+                            ready[idx] = chunk_file
+                            completed_count += 1
+                            progress.update(task, completed=completed_count)
+
+                            # Flush all consecutive chunks that are ready
+                            while next_to_flush in ready:
+                                if max_samples is None:
+                                    max_samples = self._calculate_max_samples_per_file()
+                                    silence_samples = int(self.sample_rate * 0.5)
+                                    silence = np.zeros(silence_samples)
+
+                                audio, _ = sf.read(ready.pop(next_to_flush))
+                                current_audio, current_samples, file_index = self._accumulate_and_flush(
+                                    audio, current_audio, current_samples, silence,
+                                    max_samples, book_dir, output_filename, "", file_index, output_files,
+                                )
+                                next_to_flush += 1
+
+            # Write remaining audio
+            if current_audio is not None:
+                output_path = book_dir / f"{output_filename}_part{file_index:03d}.wav"
+                self._write_audio_file(current_audio, output_path)
+                output_path = self._maybe_convert_to_mp3(output_path)
+                output_files.append(output_path)
 
         return output_files
+
+    def _accumulate_and_flush(
+        self,
+        audio: np.ndarray,
+        current_audio: Optional[np.ndarray],
+        current_samples: int,
+        silence: np.ndarray,
+        max_samples: int,
+        book_dir: Path,
+        output_filename: str,
+        file_suffix: str,
+        file_index: int,
+        output_files: List[Path],
+    ) -> Tuple[Optional[np.ndarray], int, int]:
+        """Add audio to the accumulator buffer, flushing to disk when full.
+
+        Returns:
+            Tuple of (current_audio, current_samples, file_index)
+        """
+        silence_samples = len(silence)
+
+        if current_audio is None:
+            return audio, len(audio), file_index
+
+        combined_len = current_samples + silence_samples + len(audio)
+        if combined_len > max_samples:
+            # Flush current buffer to disk
+            output_path = book_dir / f"{output_filename}{file_suffix}_part{file_index:03d}.wav"
+            self._write_audio_file(current_audio, output_path)
+            output_path = self._maybe_convert_to_mp3(output_path)
+            output_files.append(output_path)
+            return audio, len(audio), file_index + 1
+
+        current_audio = np.concatenate([current_audio, silence, audio])
+        return current_audio, len(current_audio), file_index
 
     def convert_chapters(
         self,
         chapters: List[Chapter],
         output_filename: str,
     ) -> List[Path]:
-        """Convert a list of chapters to speech, one file set per chapter."""
+        """Convert chapters to speech, flushing each chapter to disk as it completes."""
         book_dir = self.output_dir / output_filename
         book_dir.mkdir(parents=True, exist_ok=True)
 
         all_output_files: List[Path] = []
 
-        # Flatten all chapters into a single chunk list for maximum parallelism
-        chapter_chunks: List[Tuple[str, List[str]]] = []
-        all_chunks: List[Tuple[int, str, str]] = []  # (chapter_idx, slug_suffix, chunk_text)
+        # Pre-compute all chapter metadata and total chunk count for progress
+        chapter_info: List[Tuple[str, List[str]]] = []
         total_chunks = 0
-
         for ch_num, (title, text) in enumerate(chapters, 1):
             text = _normalize_for_tts(text)
             chunks = self._split_text_into_chunks(text)
             slug = re.sub(r'[^\w]+', '_', title.lower()).strip('_')[:30]
             suffix = f"_ch{ch_num:02d}_{slug}"
-            chapter_chunks.append((suffix, chunks))
-            for chunk in chunks:
-                all_chunks.append((ch_num - 1, suffix, chunk))
+            chapter_info.append((suffix, chunks))
             total_chunks += len(chunks)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_dir = Path(temp_dir)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task(
+                f"Converting chapters ({len(self.workers)} worker{'s' if len(self.workers) > 1 else ''})...",
+                total=total_chunks,
+            )
+            global_completed = 0
 
-            # Process all chunks across all chapters in parallel
-            all_text = [c[2] for c in all_chunks]
+            for suffix, chunks in chapter_info:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_dir = Path(temp_dir)
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task(
-                    f"Converting chapters to speech ({len(self.workers)} GPU{'s' if len(self.workers) > 1 else ''})...",
-                    total=total_chunks,
-                )
+                    chunk_files = self._process_chunks_parallel(
+                        chunks, temp_dir, progress, task,
+                        completed_offset=global_completed,
+                    )
+                    global_completed += len(chunks)
 
-                chunk_files = self._process_chunks_parallel(
-                    all_text, temp_dir, progress, task
-                )
-
-            # Regroup chunk files by chapter
-            idx = 0
-            for suffix, chunks in chapter_chunks:
-                chapter_file_list = chunk_files[idx:idx + len(chunks)]
-                idx += len(chunks)
-
-                chapter_files = self._combine_chunks_to_files(
-                    chapter_file_list, book_dir, output_filename, file_suffix=suffix
-                )
-                all_output_files.extend(chapter_files)
+                    chapter_files = self._combine_chunks_to_files(
+                        chunk_files, book_dir, output_filename, file_suffix=suffix,
+                    )
+                    all_output_files.extend(chapter_files)
 
         return all_output_files
 
