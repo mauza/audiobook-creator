@@ -38,7 +38,7 @@ class _GPUWorker:
         voice_clone_prompt=None,
     ):
         self.device = device
-        dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        dtype = torch.float16 if device.startswith("cuda") or device == "mps" else torch.float32
         self.model = Qwen3TTSModel.from_pretrained(
             model_name,
             device_map=device,
@@ -118,7 +118,7 @@ class TTSConverter:
             sample_path = Path(voice_sample)
             if not sample_path.exists():
                 raise FileNotFoundError(f"Voice sample not found: {voice_sample}")
-            dtype = torch.float16 if devices[0].startswith("cuda") else torch.float32
+            dtype = torch.float16 if devices[0].startswith("cuda") or devices[0] == "mps" else torch.float32
             tmp_model = Qwen3TTSModel.from_pretrained(
                 model_name,
                 device_map=devices[0],
@@ -163,6 +163,8 @@ class TTSConverter:
                 count = torch.cuda.device_count()
                 if count > 0:
                     return [f"cuda:{i}" for i in range(count)]
+            if torch.backends.mps.is_available():
+                return ["mps"]
             return ["cpu"]
 
         if "," in device:
@@ -429,7 +431,7 @@ class TTSConverter:
                 TimeRemainingColumn(),
             ) as progress:
                 task = progress.add_task(
-                    f"Converting text to speech ({num_gpus} GPU{'s' if num_gpus > 1 else ''}, batch size {self.batch_size})...",
+                    f"Converting text to speech ({num_gpus} device{'s' if num_gpus > 1 else ''}, batch size {self.batch_size})...",
                     total=len(text_chunks),
                 )
 
@@ -590,7 +592,7 @@ class TTSConverter:
             TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task(
-                f"Converting chapters ({len(self.workers)} GPU{'s' if len(self.workers) > 1 else ''}, batch size {self.batch_size})...",
+                f"Converting chapters ({len(self.workers)} device{'s' if len(self.workers) > 1 else ''}, batch size {self.batch_size})...",
                 total=total_chunks,
             )
             global_completed = 0
