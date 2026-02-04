@@ -66,17 +66,61 @@ class _GPUWorker:
         return wavs, sr
 
 
+class _KokoroWorker:
+    """A Kokoro TTS model instance."""
+
+    SAMPLE_RATE = 24000
+    LANG_CODE_MAP = {
+        "English": "a",
+        "American": "a",
+        "British": "b",
+        "Spanish": "e",
+        "French": "f",
+        "Japanese": "j",
+        "Chinese": "z",
+        "Mandarin": "z",
+        "Korean": "a",  # Fallback to American English
+        "German": "a",
+        "Russian": "a",
+        "Portuguese": "a",
+        "Italian": "a",
+    }
+
+    def __init__(self, voice: str, language: str):
+        from kokoro import KPipeline
+
+        lang_code = self.LANG_CODE_MAP.get(language, "a")
+        self.pipeline = KPipeline(lang_code=lang_code)
+        self.voice = voice
+
+    def generate_batch(self, texts: List[str]) -> Tuple[List[np.ndarray], int]:
+        """Generate audio for texts (processes sequentially via generator)."""
+        wavs = []
+        for text in texts:
+            audio_chunks = []
+            for _, _, audio in self.pipeline(text, voice=self.voice, speed=1):
+                audio_chunks.append(audio)
+            wavs.append(np.concatenate(audio_chunks) if audio_chunks else np.array([]))
+        return wavs, self.SAMPLE_RATE
+
+
 class TTSConverter:
-    """Convert text to speech using Qwen3-TTS with multi-GPU support."""
+    """Convert text to speech using Qwen3-TTS or Kokoro with multi-GPU support."""
 
     # Constants for file size management
     MAX_FILE_SIZE_MB = 100
     BYTES_PER_SAMPLE = 2  # 16-bit audio = 2 bytes
 
+    # Default voices per engine
+    DEFAULT_VOICES = {
+        "qwen3": "Ryan",
+        "kokoro": "af_heart",
+    }
+
     def __init__(
         self,
         output_dir: str = "output",
-        voice: str = "Ryan",
+        voice: Optional[str] = None,
         language: str = "English",
         chunk_size: int = 500,
         model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
@@ -85,75 +129,84 @@ class TTSConverter:
         voice_sample: Optional[str] = None,
         voice_text: Optional[str] = None,
         batch_size: int = 4,
+        tts_engine: str = "kokoro",
     ):
         """Initialize the TTS converter.
 
         Args:
             output_dir: Directory to save audio files
-            voice: Speaker name (Vivian, Serena, Dylan, Eric, Ryan, Aiden, etc.)
+            voice: Speaker name (engine-specific; None uses engine default)
             language: Language name (English, Chinese, Japanese, Korean, etc.)
             chunk_size: Number of characters to process at once
-            model_name: Qwen3-TTS model name or path
+            model_name: Qwen3-TTS model name or path (ignored for Kokoro)
             device: Device spec. "auto" to use all GPUs, "cuda:0", "cuda:0,cuda:1", or "cpu"
             output_format: Output audio format ("wav" or "mp3")
-            voice_sample: Path to a reference audio file for voice cloning
-            voice_text: Transcript of the voice sample (recommended for quality)
+            voice_sample: Path to a reference audio file for voice cloning (qwen3 only)
+            voice_text: Transcript of the voice sample (qwen3 only)
             batch_size: Number of chunks to process per inference call (default 4)
+            tts_engine: TTS engine to use ("qwen3" or "kokoro")
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.voice = voice
+        self.tts_engine = tts_engine
+        self.voice = voice if voice else self.DEFAULT_VOICES.get(tts_engine, "Ryan")
         self.language = language
         self.chunk_size = chunk_size
         self.sample_rate = None
         self.output_format = output_format
         self.batch_size = batch_size
 
-        # Resolve device list
-        devices = self._resolve_devices(device)
-
-        # Build voice clone prompt on first device if needed
-        voice_clone_prompt = None
-        if voice_sample:
-            sample_path = Path(voice_sample)
-            if not sample_path.exists():
-                raise FileNotFoundError(f"Voice sample not found: {voice_sample}")
-            dtype = torch.float16 if devices[0].startswith("cuda") or devices[0] == "mps" else torch.float32
-            tmp_model = Qwen3TTSModel.from_pretrained(
-                model_name,
-                device_map=devices[0],
-                dtype=dtype,
-                attn_implementation="sdpa",
-            )
-            voice_clone_prompt = tmp_model.create_voice_clone_prompt(
-                ref_audio=str(sample_path),
-                ref_text=voice_text,
-                x_vector_only_mode=voice_text is None,
-            )
-            # Reuse this as the first worker instead of reloading
-            first_worker = _GPUWorker.__new__(_GPUWorker)
-            first_worker.device = devices[0]
-            first_worker.model = tmp_model
-            first_worker.voice = voice
-            first_worker.language = language
-            first_worker.voice_clone_prompt = voice_clone_prompt
+        if tts_engine == "kokoro":
+            # Kokoro: single worker instance (handles its own device placement)
+            self.workers: List[Union[_GPUWorker, _KokoroWorker]] = [
+                _KokoroWorker(voice=self.voice, language=language)
+            ]
         else:
-            first_worker = None
+            # Qwen3-TTS: multi-GPU support
+            devices = self._resolve_devices(device)
 
-        # Create one worker per GPU
-        self.workers: List[_GPUWorker] = []
-        for i, dev in enumerate(devices):
-            if first_worker is not None and i == 0:
-                self.workers.append(first_worker)
-                continue
-            worker = _GPUWorker(
-                model_name=model_name,
-                device=dev,
-                voice=voice,
-                language=language,
-                voice_clone_prompt=voice_clone_prompt,
-            )
-            self.workers.append(worker)
+            # Build voice clone prompt on first device if needed
+            voice_clone_prompt = None
+            if voice_sample:
+                sample_path = Path(voice_sample)
+                if not sample_path.exists():
+                    raise FileNotFoundError(f"Voice sample not found: {voice_sample}")
+                dtype = torch.float16 if devices[0].startswith("cuda") or devices[0] == "mps" else torch.float32
+                tmp_model = Qwen3TTSModel.from_pretrained(
+                    model_name,
+                    device_map=devices[0],
+                    dtype=dtype,
+                    attn_implementation="sdpa",
+                )
+                voice_clone_prompt = tmp_model.create_voice_clone_prompt(
+                    ref_audio=str(sample_path),
+                    ref_text=voice_text,
+                    x_vector_only_mode=voice_text is None,
+                )
+                # Reuse this as the first worker instead of reloading
+                first_worker = _GPUWorker.__new__(_GPUWorker)
+                first_worker.device = devices[0]
+                first_worker.model = tmp_model
+                first_worker.voice = self.voice
+                first_worker.language = language
+                first_worker.voice_clone_prompt = voice_clone_prompt
+            else:
+                first_worker = None
+
+            # Create one worker per GPU
+            self.workers = []
+            for i, dev in enumerate(devices):
+                if first_worker is not None and i == 0:
+                    self.workers.append(first_worker)
+                    continue
+                worker = _GPUWorker(
+                    model_name=model_name,
+                    device=dev,
+                    voice=self.voice,
+                    language=language,
+                    voice_clone_prompt=voice_clone_prompt,
+                )
+                self.workers.append(worker)
 
     @staticmethod
     def _resolve_devices(device: str) -> List[str]:

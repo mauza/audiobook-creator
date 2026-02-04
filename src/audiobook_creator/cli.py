@@ -27,10 +27,16 @@ def cli():
     type=click.Path(),
 )
 @click.option(
+    "--tts-engine",
+    type=click.Choice(["qwen3", "kokoro"]),
+    default="kokoro",
+    help="TTS engine to use (default: kokoro)",
+)
+@click.option(
     "--voice",
     "-v",
-    default="Ryan",
-    help="Speaker voice (Vivian, Serena, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee, Uncle_Fu)",
+    default=None,
+    help="Speaker voice (qwen3: Ryan, Vivian, etc.; kokoro: af_heart, af_bella, etc.)",
 )
 @click.option(
     "--language",
@@ -78,12 +84,12 @@ def cli():
     "--voice-sample",
     type=click.Path(exists=True),
     default=None,
-    help="Path to a reference audio file for voice cloning (10-30s, clean audio)",
+    help="Path to a reference audio file for voice cloning (10-30s, clean audio; qwen3 only)",
 )
 @click.option(
     "--voice-text",
     default=None,
-    help="Transcript of the voice sample (recommended for better quality)",
+    help="Transcript of the voice sample (recommended for better quality; qwen3 only)",
 )
 @click.option(
     "--batch-size",
@@ -95,6 +101,7 @@ def cli():
 def convert_file(
     input_file: str,
     output_dir: str,
+    tts_engine: str,
     voice: str,
     language: str,
     model: str,
@@ -109,6 +116,14 @@ def convert_file(
 ):
     """Convert a text file to an audiobook."""
     try:
+        if tts_engine == "kokoro" and (voice_sample or voice_text):
+            console.print(
+                "[yellow]Warning:[/yellow] Voice cloning (--voice-sample, --voice-text) "
+                "is not supported with Kokoro. These options will be ignored."
+            )
+            voice_sample = None
+            voice_text = None
+
         converter = TTSConverter(
             output_dir=output_dir,
             voice=voice,
@@ -119,6 +134,7 @@ def convert_file(
             voice_sample=voice_sample,
             voice_text=voice_text,
             batch_size=batch_size,
+            tts_engine=tts_engine,
         )
 
         output_path = converter.convert_file(
@@ -146,10 +162,16 @@ def convert_file(
     type=click.Path(),
 )
 @click.option(
+    "--tts-engine",
+    type=click.Choice(["qwen3", "kokoro"]),
+    default="kokoro",
+    help="TTS engine to use (default: kokoro)",
+)
+@click.option(
     "--voice",
     "-v",
-    default="Ryan",
-    help="Speaker voice (Vivian, Serena, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee, Uncle_Fu)",
+    default=None,
+    help="Speaker voice (qwen3: Ryan, Vivian, etc.; kokoro: af_heart, af_bella, etc.)",
 )
 @click.option(
     "--language",
@@ -181,12 +203,12 @@ def convert_file(
     "--voice-sample",
     type=click.Path(exists=True),
     default=None,
-    help="Path to a reference audio file for voice cloning (10-30s, clean audio)",
+    help="Path to a reference audio file for voice cloning (10-30s, clean audio; qwen3 only)",
 )
 @click.option(
     "--voice-text",
     default=None,
-    help="Transcript of the voice sample (recommended for better quality)",
+    help="Transcript of the voice sample (recommended for better quality; qwen3 only)",
 )
 @click.option(
     "--batch-size",
@@ -199,6 +221,7 @@ def convert_text(
     text: str,
     output_filename: str,
     output_dir: str,
+    tts_engine: str,
     voice: str,
     language: str,
     model: str,
@@ -210,6 +233,14 @@ def convert_text(
 ):
     """Convert text to an audiobook."""
     try:
+        if tts_engine == "kokoro" and (voice_sample or voice_text):
+            console.print(
+                "[yellow]Warning:[/yellow] Voice cloning (--voice-sample, --voice-text) "
+                "is not supported with Kokoro. These options will be ignored."
+            )
+            voice_sample = None
+            voice_text = None
+
         converter = TTSConverter(
             output_dir=output_dir,
             voice=voice,
@@ -220,6 +251,7 @@ def convert_text(
             voice_sample=voice_sample,
             voice_text=voice_text,
             batch_size=batch_size,
+            tts_engine=tts_engine,
         )
 
         output_path = converter.convert_text(
