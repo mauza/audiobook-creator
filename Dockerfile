@@ -15,7 +15,7 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY src/ src/
 
-RUN uv pip install --system -e .
+RUN uv pip install --system -e ".[local]"
 
 RUN mkdir -p /app/input /app/output
 

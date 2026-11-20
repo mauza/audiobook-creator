@@ -13,7 +13,7 @@ console = Console()
 
 @click.group()
 def cli():
-    """Convert text to audiobooks using Qwen3-TTS."""
+    """Convert text to audiobooks with Phonon, Kokoro or Qwen3-TTS."""
     pass
 
 
@@ -28,15 +28,22 @@ def cli():
 )
 @click.option(
     "--tts-engine",
-    type=click.Choice(["qwen3", "kokoro"]),
-    default="kokoro",
-    help="TTS engine to use (default: kokoro)",
+    type=click.Choice(["phonon", "qwen3", "kokoro"]),
+    default="phonon",
+    help="TTS engine: phonon (HTTP server), or qwen3/kokoro in-process (default: phonon)",
+)
+@click.option(
+    "--tts-url",
+    envvar="PHONON_URL",
+    default="http://phonon-tts.phonon-tts:8880",
+    show_default=True,
+    help="Base URL of an OpenAI-compatible /v1/audio/speech server (phonon only; env PHONON_URL)",
 )
 @click.option(
     "--voice",
     "-v",
     default=None,
-    help="Speaker voice (qwen3: Ryan, Vivian, etc.; kokoro: af_heart, af_bella, etc.)",
+    help="Speaker voice (phonon: Hadley, Everly, etc.; qwen3: Ryan, etc.; kokoro: af_heart, etc.)",
 )
 @click.option(
     "--language",
@@ -66,9 +73,9 @@ def cli():
     "--format",
     "-f",
     "output_format",
-    type=click.Choice(["wav", "mp3"]),
+    type=click.Choice(["wav", "mp3", "m4b"]),
     default="wav",
-    help="Output audio format",
+    help="Output audio format (m4b: one file with chapters, tags and cover)",
 )
 @click.option(
     "--chapters/--no-chapters",
@@ -102,6 +109,7 @@ def convert_file(
     input_file: str,
     output_dir: str,
     tts_engine: str,
+    tts_url: str,
     voice: str,
     language: str,
     model: str,
@@ -116,10 +124,10 @@ def convert_file(
 ):
     """Convert a text file to an audiobook."""
     try:
-        if tts_engine == "kokoro" and (voice_sample or voice_text):
+        if tts_engine != "qwen3" and (voice_sample or voice_text):
             console.print(
                 "[yellow]Warning:[/yellow] Voice cloning (--voice-sample, --voice-text) "
-                "is not supported with Kokoro. These options will be ignored."
+                f"is not supported with {tts_engine}. These options will be ignored."
             )
             voice_sample = None
             voice_text = None
@@ -135,6 +143,7 @@ def convert_file(
             voice_text=voice_text,
             batch_size=batch_size,
             tts_engine=tts_engine,
+            tts_url=tts_url,
         )
 
         output_path = converter.convert_file(
@@ -163,15 +172,22 @@ def convert_file(
 )
 @click.option(
     "--tts-engine",
-    type=click.Choice(["qwen3", "kokoro"]),
-    default="kokoro",
-    help="TTS engine to use (default: kokoro)",
+    type=click.Choice(["phonon", "qwen3", "kokoro"]),
+    default="phonon",
+    help="TTS engine: phonon (HTTP server), or qwen3/kokoro in-process (default: phonon)",
+)
+@click.option(
+    "--tts-url",
+    envvar="PHONON_URL",
+    default="http://phonon-tts.phonon-tts:8880",
+    show_default=True,
+    help="Base URL of an OpenAI-compatible /v1/audio/speech server (phonon only; env PHONON_URL)",
 )
 @click.option(
     "--voice",
     "-v",
     default=None,
-    help="Speaker voice (qwen3: Ryan, Vivian, etc.; kokoro: af_heart, af_bella, etc.)",
+    help="Speaker voice (phonon: Hadley, Everly, etc.; qwen3: Ryan, etc.; kokoro: af_heart, etc.)",
 )
 @click.option(
     "--language",
@@ -195,9 +211,9 @@ def convert_file(
     "--format",
     "-f",
     "output_format",
-    type=click.Choice(["wav", "mp3"]),
+    type=click.Choice(["wav", "mp3", "m4b"]),
     default="wav",
-    help="Output audio format",
+    help="Output audio format (m4b: one file with chapters, tags and cover)",
 )
 @click.option(
     "--voice-sample",
@@ -222,6 +238,7 @@ def convert_text(
     output_filename: str,
     output_dir: str,
     tts_engine: str,
+    tts_url: str,
     voice: str,
     language: str,
     model: str,
@@ -233,10 +250,10 @@ def convert_text(
 ):
     """Convert text to an audiobook."""
     try:
-        if tts_engine == "kokoro" and (voice_sample or voice_text):
+        if tts_engine != "qwen3" and (voice_sample or voice_text):
             console.print(
                 "[yellow]Warning:[/yellow] Voice cloning (--voice-sample, --voice-text) "
-                "is not supported with Kokoro. These options will be ignored."
+                f"is not supported with {tts_engine}. These options will be ignored."
             )
             voice_sample = None
             voice_text = None
@@ -252,6 +269,7 @@ def convert_text(
             voice_text=voice_text,
             batch_size=batch_size,
             tts_engine=tts_engine,
+            tts_url=tts_url,
         )
 
         output_path = converter.convert_text(

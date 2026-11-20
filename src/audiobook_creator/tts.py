@@ -1,15 +1,20 @@
-"""Text-to-speech conversion module using Qwen3-TTS."""
+"""Text-to-speech conversion with Phonon (HTTP), Kokoro or Qwen3-TTS."""
 
+import io
+import json
 import re
+import shutil
+import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
-import torch
-from qwen_tts import Qwen3TTSModel
 from rich.progress import (
     BarColumn,
     Progress,
@@ -20,9 +25,10 @@ from rich.progress import (
 
 from audiobook_creator.file_handlers import (
     Chapter,
-    extract_text_from_file,
     _normalize_for_tts,
     _split_into_sentences,
+    extract_epub_metadata,
+    extract_text_from_file,
 )
 
 
@@ -37,6 +43,9 @@ class _GPUWorker:
         language: str,
         voice_clone_prompt=None,
     ):
+        import torch
+        from qwen_tts import Qwen3TTSModel
+
         self.device = device
         dtype = torch.float16 if device.startswith("cuda") or device == "mps" else torch.float32
         self.model = Qwen3TTSModel.from_pretrained(
@@ -104,6 +113,67 @@ class _KokoroWorker:
         return wavs, self.SAMPLE_RATE
 
 
+class _PhononWorker:
+    """Phonon, or any server with OpenAI's /v1/audio/speech API, over HTTP.
+
+    Requests go one at a time: the Phonon pod is CPU-bound, and on its 2-core
+    limit two concurrent streams finish later than one (31x vs 42x realtime).
+    """
+
+    RETRIES = 6
+
+    def __init__(self, url: str, voice: str):
+        self.url = url.rstrip("/") + "/v1/audio/speech"
+        self.voice = voice
+
+    def _speak(self, text: str) -> Tuple[np.ndarray, int]:
+        body = json.dumps(
+            {"input": text, "voice": self.voice, "response_format": "wav"}
+        ).encode()
+        request = urllib.request.Request(
+            self.url, data=body, headers={"Content-Type": "application/json"}
+        )
+        for attempt in range(self.RETRIES):
+            try:
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    audio, sr = sf.read(io.BytesIO(response.read()), dtype="float32")
+                return audio, sr
+            except urllib.error.HTTPError as e:
+                # 429 means the server is busy with other callers (Jarvis).
+                if e.code != 429 and e.code < 500:
+                    detail = e.read().decode(errors="replace")[:500]
+                    raise RuntimeError(f"TTS server rejected the request: {detail}")
+                error = e
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                error = e
+            time.sleep(min(2 ** attempt, 30))
+        raise RuntimeError(f"TTS server failed after {self.RETRIES} tries: {error}")
+
+    def generate_batch(self, texts: List[str]) -> Tuple[List[np.ndarray], int]:
+        results = [self._speak(text) for text in texts]
+        return [audio for audio, _ in results], results[0][1]
+
+
+def _trim_silence(audio: np.ndarray, sr: int, keep: float = 0.03) -> np.ndarray:
+    """Cut leading and trailing silence, so pauses come only from the plan."""
+    loud = np.flatnonzero(np.abs(audio) > 0.01)
+    if len(loud) == 0:
+        return audio
+    margin = int(sr * keep)
+    return audio[max(loud[0] - margin, 0): loud[-1] + margin + 1]
+
+
+def _spoken_title(title: str) -> str:
+    """'1: You Believe ...' -> 'Chapter 1. You Believe ...'."""
+    title = re.sub(r'^(\d+)\s*[:.]\s*', r'Chapter \1. ', title.strip())
+    title = re.sub(r'\s*:\s+', '. ', title)
+    return title if title.endswith(('.', '!', '?')) else title + '.'
+
+
+def _ffmetadata_value(value: str) -> str:
+    return re.sub(r'([=;#\\\n])', r'\\\1', value)
+
+
 class TTSConverter:
     """Convert text to speech using Qwen3-TTS or Kokoro with multi-GPU support."""
 
@@ -115,7 +185,17 @@ class TTSConverter:
     DEFAULT_VOICES = {
         "qwen3": "Ryan",
         "kokoro": "af_heart",
+        # Settled, kind, middle-aged US voice; the best UTMOS (4.47) and the
+        # calmest pace of the US voices on a self-help passage (2026-11-20).
+        "phonon": "Hadley",
     }
+
+    # Silence between chunks, in seconds. Chunks are trimmed first.
+    SENTENCE_GAP = 0.35
+    PARAGRAPH_GAP = 0.75
+    TITLE_GAP = 1.2
+    CHAPTER_GAP = 2.0
+    LOUDNESS_LUFS = -19
 
     def __init__(
         self,
@@ -129,7 +209,8 @@ class TTSConverter:
         voice_sample: Optional[str] = None,
         voice_text: Optional[str] = None,
         batch_size: int = 4,
-        tts_engine: str = "kokoro",
+        tts_engine: str = "phonon",
+        tts_url: str = "http://phonon-tts.phonon-tts:8880",
     ):
         """Initialize the TTS converter.
 
@@ -144,7 +225,8 @@ class TTSConverter:
             voice_sample: Path to a reference audio file for voice cloning (qwen3 only)
             voice_text: Transcript of the voice sample (qwen3 only)
             batch_size: Number of chunks to process per inference call (default 4)
-            tts_engine: TTS engine to use ("qwen3" or "kokoro")
+            tts_engine: TTS engine to use ("phonon", "qwen3" or "kokoro")
+            tts_url: Base URL of the speech server (phonon only)
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -156,13 +238,18 @@ class TTSConverter:
         self.output_format = output_format
         self.batch_size = batch_size
 
-        if tts_engine == "kokoro":
+        if tts_engine == "phonon":
+            self.workers = [_PhononWorker(url=tts_url, voice=self.voice)]
+        elif tts_engine == "kokoro":
             # Kokoro: single worker instance (handles its own device placement)
             self.workers: List[Union[_GPUWorker, _KokoroWorker]] = [
                 _KokoroWorker(voice=self.voice, language=language)
             ]
         else:
             # Qwen3-TTS: multi-GPU support
+            import torch
+            from qwen_tts import Qwen3TTSModel
+
             devices = self._resolve_devices(device)
 
             # Build voice clone prompt on first device if needed
@@ -211,6 +298,8 @@ class TTSConverter:
     @staticmethod
     def _resolve_devices(device: str) -> List[str]:
         """Resolve device specification to a list of device strings."""
+        import torch
+
         if device == "auto":
             if torch.cuda.is_available():
                 count = torch.cuda.device_count()
@@ -235,37 +324,39 @@ class TTSConverter:
         max_bytes = self.MAX_FILE_SIZE_MB * 1024 * 1024
         return max_bytes // self.BYTES_PER_SAMPLE
 
+    def _normalize(self, text: str) -> str:
+        # Phonon reads digits, dates and percentages correctly on its own.
+        return _normalize_for_tts(text, spell_numbers=self.tts_engine != "phonon")
+
     def _split_text_into_chunks(self, text: str) -> List[str]:
         """Split text into chunks of approximately equal size."""
-        paragraphs = text.split('\n\n')
-        chunks = []
-        current_chunk = []
-        current_size = 0
+        return [chunk for chunk, _ in self._chunk_plan(text)]
 
-        for paragraph in paragraphs:
+    def _chunk_plan(self, text: str) -> List[Tuple[str, float]]:
+        """Split text into (chunk, pause after it) pairs.
+
+        A chunk holds whole sentences, up to chunk_size characters, and never
+        crosses a paragraph, so a paragraph ends with a longer pause.
+        """
+        plan: List[Tuple[str, float]] = []
+        for paragraph in text.split('\n\n'):
             paragraph = paragraph.strip()
             if not paragraph:
                 continue
-
-            sentences = _split_into_sentences(paragraph)
-
-            for sentence in sentences:
-                sentence_len = len(sentence)
-                if current_size + sentence_len > self.chunk_size and current_chunk:
-                    chunks.append(' '.join(current_chunk))
-                    current_chunk = [sentence]
-                    current_size = sentence_len
-                else:
-                    current_chunk.append(sentence)
-                    current_size += sentence_len
-
-        if current_chunk:
-            last_chunk = ' '.join(current_chunk)
-            if not last_chunk.endswith(('.', '!', '?')):
-                last_chunk += '.'
-            chunks.append(last_chunk)
-
-        return chunks
+            current: List[str] = []
+            size = 0
+            for sentence in _split_into_sentences(paragraph):
+                if current and size + len(sentence) > self.chunk_size:
+                    plan.append((' '.join(current), self.SENTENCE_GAP))
+                    current, size = [], 0
+                current.append(sentence)
+                size += len(sentence)
+            if current:
+                chunk = ' '.join(current).rstrip(',;:')
+                if not chunk.endswith(('.', '!', '?', '"', "'", ')')):
+                    chunk += '.'
+                plan.append((chunk, self.PARAGRAPH_GAP))
+        return plan
 
     def _process_batch_on_worker(
         self,
@@ -458,7 +549,7 @@ class TTSConverter:
         Writes output files incrementally as chunks are combined,
         so partial results are available on disk during processing.
         """
-        text = _normalize_for_tts(text)
+        text = self._normalize(text)
 
         book_dir = self.output_dir / output_filename
         book_dir.mkdir(parents=True, exist_ok=True)
@@ -630,7 +721,7 @@ class TTSConverter:
         chapter_info: List[Tuple[str, List[str]]] = []
         total_chunks = 0
         for ch_num, (title, text) in enumerate(chapters, 1):
-            text = _normalize_for_tts(text)
+            text = self._normalize(text)
             chunks = self._split_text_into_chunks(text)
             slug = re.sub(r'[^\w]+', '_', title.lower()).strip('_')[:30]
             suffix = f"_ch{ch_num:02d}_{slug}"
@@ -667,6 +758,101 @@ class TTSConverter:
 
         return all_output_files
 
+    def convert_book_m4b(
+        self,
+        chapters: List[Chapter],
+        output_filename: str,
+        metadata: Optional[dict] = None,
+    ) -> List[Path]:
+        """Write one M4B with a chapter marker per chapter, plus tags and cover.
+
+        Each chapter starts with its spoken title. Audio streams to a raw PCM
+        file as it is made, so a long book never sits in memory.
+        """
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("ffmpeg is required for M4B output")
+        metadata = metadata or {}
+        title = metadata.get("title") or output_filename
+        author = metadata.get("author") or ""
+
+        intro = title + "." + (f" Written by {author}." if author else "")
+        outro = f"This concludes {title}" + (f", by {author}." if author else ".")
+        plans: List[Tuple[str, List[Tuple[str, float]]]] = [("Opening Credits", [(intro, self.CHAPTER_GAP)])]
+        for chapter_title, text in chapters:
+            heading = self._normalize(_spoken_title(chapter_title))
+            plan = [(heading, self.TITLE_GAP)] + self._chunk_plan(self._normalize(text))
+            plan[-1] = (plan[-1][0], self.CHAPTER_GAP)
+            plans.append((chapter_title, plan))
+        plans.append(("End Credits", [(outro, 0.5)]))
+
+        book_dir = self.output_dir / output_filename
+        book_dir.mkdir(parents=True, exist_ok=True)
+        output_path = book_dir / f"{output_filename}.m4b"
+        worker = self.workers[0]
+        markers: List[Tuple[str, int, int]] = []  # title, start, end (samples)
+        written = 0
+        sr = None
+
+        with tempfile.TemporaryDirectory(dir=book_dir) as temp_dir:
+            pcm_path = Path(temp_dir) / "book.pcm"
+            with open(pcm_path, "wb") as pcm, Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(
+                    f"Narrating {len(chapters)} chapters with {self.voice}...",
+                    total=sum(len(plan) for _, plan in plans),
+                )
+                for chapter_title, plan in plans:
+                    start = written
+                    for i in range(0, len(plan), self.batch_size):
+                        batch = plan[i:i + self.batch_size]
+                        wavs, sr = worker.generate_batch([chunk for chunk, _ in batch])
+                        for (chunk, gap), audio in zip(batch, wavs):
+                            if len(audio) == 0:
+                                raise ValueError(f"No audio was generated for: {chunk[:80]}")
+                            audio = np.concatenate(
+                                [_trim_silence(audio, sr), np.zeros(int(sr * gap), np.float32)]
+                            )
+                            pcm.write((np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes())
+                            written += len(audio)
+                            progress.advance(task)
+                    markers.append((chapter_title, start, written))
+
+            lines = [";FFMETADATA1", f"title={_ffmetadata_value(title)}", "genre=Audiobook"]
+            if author:
+                lines += [f"artist={_ffmetadata_value(author)}", f"album_artist={_ffmetadata_value(author)}"]
+            lines.append(f"album={_ffmetadata_value(title)}")
+            if metadata.get("year"):
+                lines.append(f"date={metadata['year']}")
+            lines.append(f"comment={_ffmetadata_value(f'Narrated by {self.voice} ({self.tts_engine} TTS)')}")
+            for chapter_title, start, end in markers:
+                lines += ["[CHAPTER]", "TIMEBASE=1/%d" % sr, f"START={start}", f"END={end}",
+                          f"title={_ffmetadata_value(chapter_title)}"]
+            meta_path = Path(temp_dir) / "metadata.txt"
+            meta_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            cmd = ["ffmpeg", "-loglevel", "error", "-y",
+                   "-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", str(pcm_path),
+                   "-i", str(meta_path)]
+            maps = ["-map", "0:a", "-map_metadata", "1", "-map_chapters", "1"]
+            if metadata.get("cover"):
+                cover_path = Path(temp_dir) / "cover.jpg"
+                cover_path.write_bytes(metadata["cover"])
+                cmd += ["-i", str(cover_path)]
+                maps += ["-map", "2:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+            # Phonon comes out near -23.5 LUFS, quieter than most audiobooks.
+            # loudnorm raises it and limits the peaks; it resamples to 192 kHz
+            # internally, so -ar sets the rate back.
+            cmd += maps + ["-af", f"loudnorm=I={self.LOUDNESS_LUFS}:TP=-2:LRA=11", "-ar", str(sr),
+                           "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(output_path)]
+            subprocess.run(cmd, check=True)
+
+        return [output_path]
+
     def convert_file(
         self,
         input_file: str,
@@ -686,9 +872,18 @@ class TTSConverter:
         result = extract_text_from_file(
             input_path,
             encoding=encoding,
-            chapter_aware=chapter_aware,
+            chapter_aware=chapter_aware or self.output_format == "m4b",
             skip_front_matter=skip_front_matter,
         )
+
+        if self.output_format == "m4b":
+            chapters = result if isinstance(result, list) else [(output_filename, result)]
+            metadata = (
+                extract_epub_metadata(input_path)
+                if input_path.suffix.lower() == ".epub"
+                else {"title": output_filename}
+            )
+            return self.convert_book_m4b(chapters, output_filename, metadata)
 
         if chapter_aware and isinstance(result, list):
             return self.convert_chapters(result, output_filename)

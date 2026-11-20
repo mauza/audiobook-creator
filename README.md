@@ -1,95 +1,75 @@
 # Audiobook Creator
 
-A Python tool that converts text to audiobooks using the Qwen3-TTS model. This tool is designed to help create audiobooks from text files, with configurable voice and language options.
+Turns an EPUB, PDF, Markdown or text file into an audiobook. The default
+engine is [Phonon](https://github.com/gradium-ai/xn-ptts), reached over HTTP;
+Kokoro and Qwen3-TTS can also run in-process.
 
-## Features
-
-- Convert text files to audiobooks
-- Support for multiple languages and voices
-- Progress tracking during conversion
-- Docker support for easy deployment
-
-## Installation
-
-### Using pip
-
-```bash
-pip install audiobook-creator
-```
-
-### Using Docker
-
-```bash
-docker build -t audiobook-creator .
-```
+The best output is `--format m4b` from an EPUB: one file with a chapter marker
+per TOC entry, the book's title, author, year and cover, and spoken chapter
+titles and opening and closing credits. Audiobookshelf reads all of it.
 
 ## Usage
 
-### Command Line Interface
-
-The tool provides two main commands:
-
-1. Convert a text file to an audiobook:
 ```bash
-audiobook-creator convert-file input.txt --output-dir output --voice Ryan --language English
+uv venv && uv pip install -e ".[dev]"
+
+# Phonon in the home cluster (phonon-tts.phonon-tts:8880), through a port-forward:
+kpf -n phonon-tts svc/phonon-tts 8880 -- \
+  'PHONON_URL=$URL .venv/bin/audiobook-creator convert-file book.epub -f m4b -o audiobooks'
 ```
 
-2. Convert text directly to an audiobook:
-```bash
-audiobook-creator convert-text "Your text here" output_filename --output-dir output --voice Ryan --language English
-```
+Inside the cluster, the default `--tts-url` works without a port-forward. Any
+server with OpenAI's `/v1/audio/speech` API works too.
 
 ### Options
 
-- `--output-dir`, `-o`: Directory to save the audio file (default: "output")
-- `--voice`, `-v`: Speaker voice (default: "Ryan")
-- `--language`, `-l`: Language (default: "English")
-- `--model`, `-m`: Qwen3-TTS model name or path (default: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-- `--device`, `-d`: Device to run the model on (default: "cuda:0")
-- `--encoding`, `-e`: Input file encoding (default: "utf-8", convert-file only)
+- `--tts-engine`: `phonon` (default), `kokoro` or `qwen3`. The last two need
+  `uv pip install -e ".[local]"` (torch, a GPU helps).
+- `--voice`, `-v`: defaults to `Hadley` for Phonon, `af_heart` for Kokoro and
+  `Ryan` for Qwen3. A wrong Phonon voice name fails with the list of voices.
+- `--format`, `-f`: `wav`, `mp3` (both split into files of about 100 MB) or
+  `m4b`.
+- `--chapters`: one set of files per chapter (wav/mp3 only; m4b always uses
+  chapters).
+- `--include-front-matter`: also read the cover, copyright and contents
+  pages, and TOC entries such as Notes, Index and Bibliography.
+- `--voice-sample`, `--voice-text`: voice cloning (qwen3 only).
 
-### Available Speakers
+## How a book becomes audio
 
-Vivian, Serena, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee, Uncle_Fu
+- **EPUB chapters** follow the table of contents. A spine document without a
+  TOC entry continues the chapter before it. Headings that repeat the chapter
+  title are dropped, because the title is spoken from the TOC label
+  ("1: Thoughts Pass" is read as "Chapter 1. Thoughts Pass.").
+- **Paragraphs** are kept. A chunk of text sent to the engine never crosses a
+  paragraph, and each chunk is trimmed of silence, so pauses come from one
+  plan: 0.35 s between sentences, 0.75 s between paragraphs, 1.2 s after a
+  chapter title and 2 s between chapters.
+- **Text** is straightened (curly quotes, soft hyphens, odd spaces), and an em
+  dash becomes a comma pause. Roman numerals after "Part" or "Chapter" and
+  slashes between words are read as words. For Kokoro and Qwen3, numbers,
+  money and percentages are spelled out. Phonon reads digits correctly, so it
+  gets them as they are.
 
-### Available Languages
+## Choosing Phonon and the Hadley voice (2026-11-20)
 
-Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
+- On the Artificial Analysis open-weights speech arena, Phonon 31M ranks above
+  Kokoro (Elo 1108 against 1060). The only open models ranked higher (Fish
+  Audio Drama 3, Breeze TTS 2, Ming-3.0) are 0.5B to 35B parameters and run
+  at about 3x realtime or less. Phonon runs at about 42x realtime on the
+  speech 3090.
+- Run requests one at a time. The pod is CPU-bound at its 2-core limit:
+  1 stream gave 42x realtime, 2 gave 31x and 4 gave 28x.
+- Hadley was the US voice with the best UTMOS (4.47) and the calmest pace
+  (182 words per minute) on a 450-word passage. Parakeet transcribed every
+  candidate at 1.1% WER. Phonon accepts only `speed=1.0`. Slowing it by 10%
+  with ffmpeg `atempo` kept UTMOS the same, but players have a speed control,
+  so the book keeps the natural pace.
 
-### Using Docker
+## Tests
 
 ```bash
-# Convert a text file
-docker run -v $(pwd):/app audiobook-creator convert-file input.txt
-
-# Convert text directly
-docker run -v $(pwd):/app audiobook-creator convert-text "Your text here" output_filename
+.venv/bin/python -m pytest tests
 ```
 
-## Development
-
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/audiobook-creator.git
-cd audiobook-creator
-```
-
-2. Install development dependencies:
-```bash
-uv pip install -e ".[dev]"
-```
-
-3. Run tests:
-```bash
-pytest
-```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) for the text-to-speech model
-- [Click](https://click.palletsprojects.com/) for the CLI framework
-- [Rich](https://github.com/Textualize/rich) for the terminal formatting
+The M4B test needs `ffmpeg` and `ffprobe`.

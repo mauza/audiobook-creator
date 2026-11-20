@@ -23,6 +23,7 @@ wheels/
 
 # Virtual Environment
 venv/
+.venv/
 ENV/
 
 # IDE
@@ -38,4 +39,4 @@ output/
 
 # OS specific
 .DS_Store
-Thumbs.db 
+Thumbs.db

@@ -1,13 +1,11 @@
 [project]
 name = "audiobook-creator"
 version = "0.1.0"
-description = "A tool to convert text to audiobooks using Qwen3-TTS"
+description = "Convert books to audiobooks with Phonon, Kokoro or Qwen3-TTS"
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
 dependencies = [
-    "qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git",
-    "torch>=2.0.0",
     "soundfile",
     "click>=8.0.0",
     "rich>=10.0.0",
@@ -17,9 +15,17 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "num2words>=0.5.13",
     "pydub>=0.25.1",
-    "kokoro>=0.9.4",
 ]
 requires-python = ">=3.11,<3.13"
+
+[project.optional-dependencies]
+# Engines that run a model in this process. The phonon engine only needs HTTP.
+local = [
+    "qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git",
+    "torch>=2.0.0",
+    "kokoro>=0.9.4",
+]
+dev = ["pytest"]
 
 [project.scripts]
 audiobook-creator = "audiobook_creator.cli:cli"

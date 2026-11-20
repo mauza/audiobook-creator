@@ -7,21 +7,30 @@ from typing import List, Optional, Set, Tuple, Union
 import PyPDF2
 import ebooklib
 from ebooklib import epub
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, Tag
 from num2words import num2words
 
 # Type alias for chapters: (title, text)
 Chapter = Tuple[str, str]
 
 
-def _normalize_for_tts(text: str) -> str:
+ROMAN_NUMERALS = {
+    'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5, 'VI': 6, 'VII': 7, 'VIII': 8,
+    'IX': 9, 'X': 10, 'XI': 11, 'XII': 12, 'XIII': 13, 'XIV': 14, 'XV': 15,
+}
+
+
+def _normalize_for_tts(text: str, spell_numbers: bool = True) -> str:
     """Normalize text for natural TTS output.
 
-    Converts currency, percentages, ordinals, numbers, and symbols
-    to their spoken equivalents. Removes URLs and emails.
+    Straightens typographic characters, reads Roman numerals after "Part" or
+    "Chapter" and slashes between words, and removes URLs and emails. With
+    spell_numbers, it also writes out currency, percentages, ordinals and
+    numbers. Phonon reads digits correctly, so it does not need that.
 
     Args:
         text: Raw text to normalize
+        spell_numbers: Convert numbers and symbols to words
 
     Returns:
         Normalized text suitable for TTS
@@ -30,6 +39,37 @@ def _normalize_for_tts(text: str) -> str:
     text = re.sub(r'https?://\S+', '', text)
     # Remove emails
     text = re.sub(r'\S+@\S+\.\S+', '', text)
+
+    # Typography: soft hyphens, odd spaces, curly quotes, dashes, ellipses.
+    # Zero-width characters make Phonon pause for seconds or say a stray word.
+    text = re.sub('[\u00ad\u200b-\u200d\u2060\ufeff]', '', text)
+    text = re.sub('[\u00a0\u2000-\u200a\u202f]', ' ', text)
+    text = text.translate(str.maketrans({'‘': "'", '’': "'", '“': '"', '”': '"'}))
+    text = re.sub(r'\s*[—―]\s*', ', ', text)  # an em dash is a pause
+    text = re.sub(r'(?<=\d)–(?=\d)', ' to ', text)  # 2–5 percent
+    text = text.replace('–', ', ')
+    text = re.sub(r'\.( ?\.){2,}|…', '...', text)
+
+    # Part II -> Part Two (TTS reads a bare "II" as "the second" or letters)
+    def _replace_roman(m):
+        return f"{m.group(1)} {num2words(ROMAN_NUMERALS[m.group(2)]).title()}"
+
+    text = re.sub(
+        r'\b(Part|Chapter|Book|Volume|Section|Act)\s+(' + '|'.join(
+            sorted(ROMAN_NUMERALS, key=len, reverse=True)) + r')\b',
+        _replace_roman, text,
+    )
+    # floats/thoughts -> floats or thoughts (otherwise the slash is silent)
+    text = re.sub(r'(?<=[A-Za-z])/(?=[A-Za-z])', ' or ', text)
+    # Long compounds read better as separate words:
+    # hypothalamic-pituitary-adrenocortical, not "hypothalamic dash ..."
+    text = re.sub(
+        r'\b[A-Za-z]{5,}(?:-[A-Za-z]{5,}){2,}\b',
+        lambda m: m.group(0).replace('-', ' '), text,
+    )
+
+    if not spell_numbers:
+        return re.sub(r'  +', ' ', text).strip()
 
     # Currency: $42.50 -> forty-two dollars and fifty cents
     def _replace_currency(m):
@@ -47,7 +87,7 @@ def _normalize_for_tts(text: str) -> str:
         except (ValueError, OverflowError):
             return ''
 
-    text = re.sub(r'\$[\d,.]+', _replace_currency, text)
+    text = re.sub(r'\$\d[\d,]*(?:\.\d+)?', _replace_currency, text)
 
     # Percentages: 85% -> eighty-five percent
     def _replace_percent(m):
@@ -93,7 +133,7 @@ def _normalize_for_tts(text: str) -> str:
     text = re.sub(r'(?<!\w)@(?!\w)', 'at', text)
 
     # Strip leftover non-speakable chars (keep letters, digits, basic punctuation, whitespace)
-    text = re.sub(r"[^\w\s.,;:!?'\"-]", '', text)
+    text = re.sub(r"[^\w\s.,;:!?'\"()-]", '', text)
 
     # Collapse multiple spaces
     text = re.sub(r'  +', ' ', text)
@@ -328,6 +368,122 @@ def extract_text_from_pdf(
         return flat
 
 
+# Spine documents whose file name says they are not part of the reading.
+FRONT_MATTER_PATTERNS = [
+    'cover', 'toc', 'nav', 'copyright', 'title',
+    'frontmatter', 'dedication', 'halftitle',
+]
+# TOC entries an audiobook skips (citations and indexes do not read aloud).
+SKIP_TOC_LABELS = re.compile(
+    r'^(contents|table of contents|copyright|notes|endnotes|references|'
+    r'bibliography|index|praise|also by|cover)\b',
+    re.IGNORECASE,
+)
+BLOCK_TAGS = [
+    'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote',
+    'td', 'th', 'dt', 'dd', 'figcaption', 'pre', 'div',
+    # Containers: text directly inside them is a block of its own.
+    'ol', 'ul', 'dl', 'table', 'thead', 'tbody', 'tr', 'section', 'article',
+    'aside', 'header', 'footer', 'figure', 'nav', 'main',
+]
+HEADING_TAGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+
+
+def _toc_labels(book: epub.EpubBook) -> dict:
+    """Map each document href in the TOC to its label."""
+    labels: dict = {}
+
+    def walk(entries):
+        for entry in entries:
+            if isinstance(entry, tuple):
+                section, children = entry
+                if getattr(section, 'href', None):
+                    labels.setdefault(section.href.split('#')[0], section.title)
+                walk(children)
+            elif getattr(entry, 'href', None):
+                labels.setdefault(entry.href.split('#')[0], entry.title)
+
+    walk(book.toc)
+    return {href: ' '.join(label.split()) for href, label in labels.items() if label}
+
+
+def _epub_blocks(item) -> List[Tuple[str, str]]:
+    """Return (tag, text) for each leaf block of an EPUB document, in order."""
+    soup = BeautifulSoup(item.get_content(), 'html.parser')
+    for tag in soup(['script', 'style', 'sup', 'img', 'svg']):
+        tag.decompose()
+    for br in soup.find_all('br'):
+        br.replace_with(' ')
+
+    blocks: List[Tuple[str, str]] = []
+
+    def flush(tag: str, parts: List[str]) -> None:
+        text = ' '.join(''.join(parts).split())
+        if text:
+            # A numbered list item ("1  Thoughts pass") should be read as "1. ".
+            blocks.append((tag, re.sub(r'^(\d+)\.?\s+(?=\w)', r'\1. ', text)))
+
+    def walk(element: Tag) -> None:
+        if any('toc' in cls for cls in element.get('class', [])):
+            return  # a part page's list of the chapters inside it
+        # Each run of inline text between child blocks is a block of its own:
+        # unclosed <li> and <p> tags nest the paragraphs that follow them.
+        parts: List[str] = []
+        for child in element.children:
+            if isinstance(child, Tag) and child.name in BLOCK_TAGS:
+                flush(element.name, parts)
+                parts = []
+                walk(child)
+            elif isinstance(child, Tag):
+                parts.append(child.get_text())
+            elif not isinstance(child, Comment):
+                parts.append(str(child))
+        flush(element.name, parts)
+
+    walk(soup.body or soup)
+    return blocks
+
+
+def _same_words(a: str, b: str) -> bool:
+    """True when every word of a appears, in order, inside b."""
+    def norm(text: str) -> List[str]:
+        return re.sub(r'[^\w ]', '', text.lower()).split()
+
+    a_words, b_words = norm(a), norm(b)
+    return bool(a_words) and ' '.join(a_words) in ' '.join(b_words)
+
+
+def extract_epub_metadata(file_path: Path) -> dict:
+    """Title, author, year and cover image bytes of an EPUB."""
+    book = epub.read_epub(file_path)
+
+    def first(name):
+        values = book.get_metadata('DC', name)
+        return ' '.join(values[0][0].split()) if values else ''
+
+    cover = None
+    # EPUB 2 names the cover image in <meta name="cover" content="item-id"/>.
+    cover_id = next(
+        (attrs.get('content') for _, attrs in book.get_metadata('OPF', 'meta')
+         if attrs.get('name') == 'cover'),
+        None,
+    )
+    for item in book.get_items():
+        is_cover = item.get_type() == ebooklib.ITEM_COVER or (
+            cover_id and item.get_id() == cover_id
+        )
+        if is_cover and item.media_type.startswith('image/'):
+            cover = item.get_content()
+            break
+
+    return {
+        'title': first('title'),
+        'author': first('creator'),
+        'year': first('date')[:4],
+        'cover': cover,
+    }
+
+
 def extract_text_from_epub(
     file_path: Path,
     chapter_aware: bool = False,
@@ -335,96 +491,65 @@ def extract_text_from_epub(
 ) -> Union[str, List[Chapter]]:
     """Extract text from an EPUB file.
 
+    Chapters follow the book's table of contents: each TOC entry starts a
+    chapter, and spine documents without one continue the chapter before
+    them. Paragraphs are kept, separated by blank lines.
+
     Args:
         file_path: Path to the EPUB file
-        chapter_aware: If True, split into chapters based on headings
-        skip_front_matter: If True, skip cover, TOC, copyright, etc.
+        chapter_aware: If True, return chapters instead of one text
+        skip_front_matter: If True, skip cover, TOC, copyright, notes, etc.
 
     Returns:
         Extracted text, or list of (title, text) chapters if chapter_aware
     """
-    FRONT_MATTER_PATTERNS = [
-        'cover', 'toc', 'nav', 'copyright', 'titlepage',
-        'frontmatter', 'dedication', 'halftitle',
+    book = epub.read_epub(file_path)
+    labels = _toc_labels(book)
+
+    items_by_id = {item.get_id(): item for item in book.get_items()}
+    spine_items = [
+        items_by_id[item_id]
+        for item_id, _ in book.spine
+        if item_id in items_by_id
+        and items_by_id[item_id].get_type() == ebooklib.ITEM_DOCUMENT
     ]
 
-    book = epub.read_epub(file_path)
+    # Without a usable TOC, every spine document is a chapter.
+    has_toc = any((item.get_name() or '') in labels for item in spine_items)
 
-    # Get spine-ordered items
-    spine_ids = [item_id for item_id, _ in book.spine]
-    items_by_id = {item.get_id(): item for item in book.get_items()}
-    spine_items = [items_by_id[sid] for sid in spine_ids if sid in items_by_id]
-
-    # Filter front matter
-    if skip_front_matter:
-        filtered = []
-        for item in spine_items:
-            item_id = (item.get_id() or '').lower()
-            item_href = (item.get_name() or '').lower()
-            identifier = item_id + ' ' + item_href
-            if not any(pat in identifier for pat in FRONT_MATTER_PATTERNS):
-                filtered.append(item)
-        spine_items = filtered
-
-    if chapter_aware:
-        chapters: List[Chapter] = []
-        current_title = None
-        current_text_parts: List[str] = []
-
-        for item in spine_items:
-            if item.get_type() != ebooklib.ITEM_DOCUMENT:
-                continue
-            soup = BeautifulSoup(item.get_content(), 'html.parser')
-            for script in soup(["script", "style"]):
-                script.decompose()
-
-            # Look for chapter headings
-            headings = soup.find_all(['h1', 'h2'])
-            if headings:
-                for heading in headings:
-                    # Save previous chapter
-                    if current_title is not None and current_text_parts:
-                        ch_text = _clean_text(' '.join(current_text_parts))
-                        sentences = _split_into_sentences(ch_text)
-                        chapters.append((current_title, ' '.join(sentences)))
-
-                    current_title = heading.get_text(strip=True)
-                    # Get text after this heading within the same document
-                    current_text_parts = []
-                    for sibling in heading.find_next_siblings():
-                        current_text_parts.append(sibling.get_text(separator=' '))
-            else:
-                # No heading, append to current chapter
-                current_text_parts.append(soup.get_text(separator=' '))
-
-        # Save last chapter
-        if current_text_parts:
-            title = current_title or "Untitled"
-            ch_text = _clean_text(' '.join(current_text_parts))
-            sentences = _split_into_sentences(ch_text)
-            chapters.append((title, ' '.join(sentences)))
-
-        if chapters:
-            return chapters
-        # Fallback: no headings found
-
-    # Flat text extraction
-    text = []
+    chapters: List[List] = []  # [title, paragraphs]
+    skipping = False
     for item in spine_items:
-        if item.get_type() == ebooklib.ITEM_DOCUMENT:
-            soup = BeautifulSoup(item.get_content(), 'html.parser')
-            for script in soup(["script", "style"]):
-                script.decompose()
-            text.append(soup.get_text(separator=' '))
+        name = item.get_name() or ''
+        file_part = (item.get_id() + ' ' + name.rsplit('/', 1)[-1]).lower()
+        blocks = _epub_blocks(item)
+        label = labels.get(name)
+        if not has_toc:
+            label = next((text for tag, text in blocks if tag in HEADING_TAGS), None)
 
-    full_text = ' '.join(text)
-    full_text = _clean_text(full_text)
-    sentences = _split_into_sentences(full_text)
-    flat = ' '.join(sentences)
+        if skip_front_matter:
+            if label is not None and has_toc:
+                skipping = bool(SKIP_TOC_LABELS.match(label))
+            elif not chapters or any(pat in file_part for pat in FRONT_MATTER_PATTERNS):
+                continue  # a cover or title page, or front matter before the TOC starts
+            if skipping:
+                continue  # a skipped TOC entry, or more of one
+
+        if label is not None or not chapters:
+            title = label or 'Untitled'
+            # The document's own headings repeat the chapter title.
+            while blocks and blocks[0][0] in HEADING_TAGS and _same_words(blocks[0][1], title):
+                blocks.pop(0)
+            chapters.append([title, []])
+        chapters[-1][1].extend(text for _, text in blocks)
+
+    result: List[Chapter] = [
+        (title, _clean_text('\n\n'.join(paragraphs))) for title, paragraphs in chapters
+    ]
 
     if chapter_aware:
-        return [("Full Text", flat)]
-    return flat
+        return result
+    return '\n\n'.join(f"{title}\n\n{text}" for title, text in result)
 
 
 def extract_text_from_file(
