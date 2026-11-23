@@ -6,6 +6,7 @@ import pytest
 from ebooklib import epub
 
 from audiobook_creator.file_handlers import (
+    _clean_language,
     _normalize_for_tts,
     extract_epub_metadata,
     extract_text_from_epub,
@@ -92,6 +93,16 @@ def test_normalize_keeps_apostrophes_and_reads_numerals():
     assert _normalize_for_tts("It costs $42.50, about") == (
         "It costs forty-two dollars and fifty cents, about"
     )
+
+
+def test_clean_language_replaces_whole_swear_words_only(tmp_path):
+    text = "I call bullshit. (Holy shit!) Kick some ass, what the HELL. Hello, class, assume."
+    assert _clean_language(text) == (
+        "I call baloney. (Holy crap!) Kick some butt, what the HECK. Hello, class, assume."
+    )
+    converter = TTSConverter(output_dir=str(tmp_path), clean_language=True)
+    assert converter._normalize("Oh, shit — it’s a damn mess.") == "Oh, crap, it's a darn mess."
+    assert TTSConverter(output_dir=str(tmp_path))._normalize("Oh, shit.") == "Oh, shit."
 
 
 def test_spoken_titles():

@@ -25,6 +25,7 @@ from rich.progress import (
 
 from audiobook_creator.file_handlers import (
     Chapter,
+    _clean_language,
     _normalize_for_tts,
     _split_into_sentences,
     extract_epub_metadata,
@@ -211,6 +212,7 @@ class TTSConverter:
         batch_size: int = 4,
         tts_engine: str = "phonon",
         tts_url: str = "http://phonon-tts.phonon-tts:8880",
+        clean_language: bool = False,
     ):
         """Initialize the TTS converter.
 
@@ -227,6 +229,7 @@ class TTSConverter:
             batch_size: Number of chunks to process per inference call (default 4)
             tts_engine: TTS engine to use ("phonon", "qwen3" or "kokoro")
             tts_url: Base URL of the speech server (phonon only)
+            clean_language: Read swear words as milder ones ("shit" as "crap")
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -237,6 +240,7 @@ class TTSConverter:
         self.sample_rate = None
         self.output_format = output_format
         self.batch_size = batch_size
+        self.clean_language = clean_language
 
         if tts_engine == "phonon":
             self.workers = [_PhononWorker(url=tts_url, voice=self.voice)]
@@ -326,7 +330,8 @@ class TTSConverter:
 
     def _normalize(self, text: str) -> str:
         # Phonon reads digits, dates and percentages correctly on its own.
-        return _normalize_for_tts(text, spell_numbers=self.tts_engine != "phonon")
+        text = _normalize_for_tts(text, spell_numbers=self.tts_engine != "phonon")
+        return _clean_language(text) if self.clean_language else text
 
     def _split_text_into_chunks(self, text: str) -> List[str]:
         """Split text into chunks of approximately equal size."""

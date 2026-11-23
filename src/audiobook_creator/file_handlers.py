@@ -141,6 +141,43 @@ def _normalize_for_tts(text: str, spell_numbers: bool = True) -> str:
     return text.strip()
 
 
+# Swear words and the milder words read in their place. Whole words only, so
+# "class", "hello" and "assume" are untouched.
+CLEAN_WORDS = {
+    'son of a bitch': 'son of a gun',
+    'shit': 'crap', 'shits': 'craps', 'shitty': 'crappy', 'shitting': 'crapping',
+    'bullshit': 'baloney', 'horseshit': 'baloney',
+    'ass': 'butt', 'asses': 'butts', 'asshole': 'jerk', 'assholes': 'jerks',
+    'jackass': 'jerk', 'dumbass': 'dummy', 'badass': 'tough',
+    'fuck': 'frick', 'fucks': 'fricks', 'fucking': 'fricking', 'fucked': 'fricked',
+    'fucker': 'jerk', 'motherfucker': 'jerk', 'motherfucking': 'fricking',
+    'damn': 'darn', 'damned': 'darned', 'damnit': 'darn it', 'dammit': 'darn it',
+    'goddamn': 'gosh darn', 'goddamned': 'gosh darned', 'goddammit': 'gosh darn it',
+    'hell': 'heck',
+    'bitch': 'jerk', 'bitches': 'jerks', 'bitchy': 'grumpy', 'bitching': 'whining',
+    'bastard': 'jerk', 'bastards': 'jerks',
+    'piss': 'pee', 'pissed': 'ticked', 'pissing': 'peeing',
+}
+_CLEAN_PATTERN = re.compile(
+    r"\b(" + '|'.join(re.escape(w) for w in sorted(CLEAN_WORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_language(text: str) -> str:
+    """Replace swear words with milder ones, keeping their capitalization."""
+    def replace(m):
+        word = m.group(0)
+        clean = CLEAN_WORDS[word.lower()]
+        if word.isupper() and len(word) > 1:
+            return clean.upper()
+        if word[0].isupper():
+            return clean[0].upper() + clean[1:]
+        return clean
+
+    return _CLEAN_PATTERN.sub(replace, text)
+
+
 def _strip_markdown(text: str) -> str:
     """Strip markdown formatting from text.
 

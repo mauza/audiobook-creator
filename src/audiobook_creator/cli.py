@@ -99,6 +99,11 @@ def cli():
     help="Transcript of the voice sample (recommended for better quality; qwen3 only)",
 )
 @click.option(
+    "--clean-language/--keep-language",
+    default=False,
+    help="Read swear words as milder ones (shit -> crap, ass -> butt, hell -> heck)",
+)
+@click.option(
     "--batch-size",
     "-b",
     default=4,
@@ -121,6 +126,7 @@ def convert_file(
     voice_sample: str,
     voice_text: str,
     batch_size: int,
+    clean_language: bool,
 ):
     """Convert a text file to an audiobook."""
     try:
@@ -144,6 +150,7 @@ def convert_file(
             batch_size=batch_size,
             tts_engine=tts_engine,
             tts_url=tts_url,
+            clean_language=clean_language,
         )
 
         output_path = converter.convert_file(
@@ -227,6 +234,11 @@ def convert_file(
     help="Transcript of the voice sample (recommended for better quality; qwen3 only)",
 )
 @click.option(
+    "--clean-language/--keep-language",
+    default=False,
+    help="Read swear words as milder ones (shit -> crap, ass -> butt, hell -> heck)",
+)
+@click.option(
     "--batch-size",
     "-b",
     default=4,
@@ -247,6 +259,7 @@ def convert_text(
     voice_sample: str,
     voice_text: str,
     batch_size: int,
+    clean_language: bool,
 ):
     """Convert text to an audiobook."""
     try:
@@ -270,6 +283,7 @@ def convert_text(
             batch_size=batch_size,
             tts_engine=tts_engine,
             tts_url=tts_url,
+            clean_language=clean_language,
         )
 
         output_path = converter.convert_text(

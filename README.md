@@ -33,6 +33,9 @@ server with OpenAI's `/v1/audio/speech` API works too.
   chapters).
 - `--include-front-matter`: also read the cover, copyright and contents
   pages, and TOC entries such as Notes, Index and Bibliography.
+- `--clean-language`: read swear words as milder ones (shit as crap, ass as
+  butt, hell as heck). Whole words only, so "class" and "hello" stay as they
+  are. The list is `CLEAN_WORDS` in `file_handlers.py`.
 - `--voice-sample`, `--voice-text`: voice cloning (qwen3 only).
 
 ## How a book becomes audio
